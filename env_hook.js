@@ -197,9 +197,22 @@
                 _log('%c register stack ', 'color:#aaa;font-size:11px', entry.registerStack);
                 _groupEnd();
             } else {
-                _log(`%c ${op} %c ${fullPath}`,
-                    `color:#fff;background:${bg};padding:1px 5px;border-radius:3px`,
-                    `color:${fg}`, result);
+                // get / set / has / del 等操作
+                // 若 extraMeta 携带 location 信息，在路径后附加显示
+                const locTag = entry.location
+                    ? `  %c[${entry.location}${entry.ownerType ? ' · ' + entry.ownerType : ''}]`
+                    : '';
+                const locStyle = 'color:#999;font-size:10px;font-style:italic';
+
+                if (locTag) {
+                    _log(`%c ${op} %c ${fullPath}` + locTag,
+                        `color:#fff;background:${bg};padding:1px 5px;border-radius:3px`,
+                        `color:${fg}`, locStyle, result);
+                } else {
+                    _log(`%c ${op} %c ${fullPath}`,
+                        `color:#fff;background:${bg};padding:1px 5px;border-radius:3px`,
+                        `color:${fg}`, result);
+                }
             }
 
             if (window.__envHookCb) window.__envHookCb(entry);
@@ -209,6 +222,24 @@
     /* ── Proxy 缓存 ──────────────────────────────────── */
     const proxyToRaw = new WeakMap();
     const rawToProxy = new WeakMap();
+    const HOOKED_FUNCS = new WeakSet();
+    const HOOK_ORIGINALS = new WeakMap();
+
+    function markHooked(wrapper, original) {
+        if (typeof wrapper === 'function') HOOKED_FUNCS.add(wrapper);
+        if (typeof wrapper === 'function' && typeof original === 'function') {
+            HOOK_ORIGINALS.set(wrapper, original);
+        }
+        return wrapper;
+    }
+
+    function isHooked(fn) {
+        return typeof fn === 'function' && HOOKED_FUNCS.has(fn);
+    }
+
+    function getHookOriginal(fn) {
+        return (typeof fn === 'function' && HOOK_ORIGINALS.get(fn)) || fn;
+    }
 
     function unwrap(v) {
         let cur = v, n = 10;
@@ -322,8 +353,204 @@
     }
 
     /* ══════════════════════════════════════════════════
-       动态对象打补丁
+       ★ 共享工具：wrapPropInPlace
+       ─────────────────────────────────────────────────
+       按属性的「原始所在位置」决定把 wrapper getter 写到哪里：
+
+         情况 A —— 属性在实例 own 上（有 own descriptor）
+           → 直接在实例上 redefine（位置不变，own 特征保持）
+           → log 显示 location: own
+
+         情况 B —— 属性在原型链某层上（proto getter）
+           → 在那一层的 prototype 上 redefine
+           → 实例 own 上不产生任何新属性（own 特征保持）
+           → log 显示 location: proto:N  ownerType: Navigator/Screen/...
+
+       这样两种情况都能被正确拦截，同时
+       getOwnPropertyDescriptor(obj, key) 的返回值与原生完全一致。
+
+       参数：
+         obj      — 要监控的对象实例（navigator / screen / location ...）
+         key      — 属性名
+         basePath — record 用的路径前缀（'window.navigator' 等）
+         opts     — { set: boolean }  是否同时 wrap setter（默认 false）
+       返回：
+         { location, depth, ownerType } 或 null（找不到时）
     ══════════════════════════════════════════════════ */
+    function wrapPropInPlace(obj, key, basePath, opts) {
+        if (!obj || typeof key !== 'string') return null;
+        opts = opts || {};
+
+        /* 1. 先看实例 own */
+        let ownD = null;
+        try { ownD = _ownDesc(obj, key); } catch (_) {}
+
+        if (ownD) {
+            /* ── 情况 A：实例 own property ── */
+            const location = 'own';
+
+            if (ownD.get && !isHooked(ownD.get)) {
+                // getter 形式的 own property（少见但存在，如某些 polyfill 注入的属性）
+                const origGet = ownD.get;
+                const newGet = function () {
+                    const v = _rApply(origGet, this, []);
+                    record('get', basePath, key, v, undefined, { location });
+                    return v;
+                };
+                markHooked(newGet, origGet);
+                try {
+                    _defProp(obj, key, {
+                        get: newGet,
+                        set: (opts.set && ownD.set) ? function (v) {
+                            record('set', basePath, key, v, undefined, { location });
+                            _rApply(ownD.set, this, [v]);
+                        } : ownD.set,
+                        enumerable: ownD.enumerable,
+                        configurable: ownD.configurable !== false ? true : ownD.configurable,
+                    });
+                } catch (_) {}
+
+            } else if ('value' in ownD && typeof ownD.value !== 'function') {
+                // 普通值属性（data property）— 用 getter/setter 覆盖以监控读取
+                const snapshot = ownD.value;
+                const newGet = function () {
+                    record('get', basePath, key, snapshot, undefined, { location });
+                    return snapshot;
+                };
+                markHooked(newGet);
+                try {
+                    _defProp(obj, key, {
+                        get: newGet,
+                        set: opts.set ? function (v) {
+                            record('set', basePath, key, v, undefined, { location });
+                            // 更新 snapshot 引用
+                            _defProp(obj, key, { value: v, writable: true, enumerable: ownD.enumerable, configurable: true });
+                        } : undefined,
+                        enumerable: ownD.enumerable,
+                        configurable: true,
+                    });
+                } catch (_) {}
+            }
+
+            return { location, depth: 0, ownerType: obj.constructor?.name || 'Object' };
+        }
+
+        /* 2. own 上没有 → 沿原型链查找 */
+        let depth = 1, proto = _getProto(obj);
+        while (proto !== null && proto !== undefined) {
+            let protoD = null;
+            try { protoD = _ownDesc(proto, key); } catch (_) {}
+
+            if (protoD) {
+                /* ── 情况 B：在 proto:N 层上 ── */
+                const ownerType = proto.constructor?.name
+                    || proto[Symbol.toStringTag]
+                    || 'Object';
+                const location = 'proto:' + depth;
+
+                if (protoD.get && !isHooked(protoD.get)) {
+                    const origGet = protoD.get;
+                    const newGet = function () {
+                        const v = _rApply(origGet, obj, []);
+                        record('get', basePath, key, v, undefined, { location, ownerType, depth });
+                        return v;
+                    };
+                    markHooked(newGet, origGet);
+                    try {
+                        _defProp(proto, key, {
+                            get: newGet,
+                            set: (opts.set && protoD.set) ? function (v) {
+                                record('set', basePath, key, v, undefined, { location, ownerType });
+                                _rApply(protoD.set, this, [v]);
+                            } : protoD.set,
+                            enumerable: protoD.enumerable,
+                            configurable: true,
+                        });
+                    } catch (_) {}
+                }
+
+                return { location, depth, ownerType };
+            }
+
+            proto = _getProto(proto);
+            depth++;
+            if (depth > 12) break;
+        }
+
+        return null;  // 整条链上都没有
+    }
+
+    /* ══════════════════════════════════════════════════
+       ★ 共享工具：wrapMethodInPlace
+       ─────────────────────────────────────────────────
+       同理：按方法原始所在位置（own or proto:N）决定 wrap 位置，
+       保持 getOwnPropertyDescriptor 的返回值与原生一致。
+    ══════════════════════════════════════════════════ */
+    function wrapMethodInPlace(obj, key, basePath, opts) {
+        if (!obj || typeof key !== 'string') return null;
+        opts = opts || {};
+
+        /* 1. 先看实例 own */
+        let ownD = null;
+        try { ownD = _ownDesc(obj, key); } catch (_) {}
+
+        if (ownD && typeof ownD.value === 'function' && !isHooked(ownD.value)) {
+            const origFn = ownD.value;
+            const location = 'own';
+            const wrapped = function (...args) {
+                const invokeThis = opts.bindThis !== undefined ? opts.bindThis : this;
+                const ret = _rApply(origFn, invokeThis, unwrapArgs(args));
+                record('call', basePath, key, args, ret, { location });
+                return ret;
+            };
+            markHooked(wrapped, origFn);
+            try {
+                _defProp(obj, key, {
+                    value: wrapped,
+                    writable: ownD.writable,
+                    enumerable: ownD.enumerable,
+                    configurable: ownD.configurable !== false ? true : ownD.configurable,
+                });
+            } catch (_) {}
+            return { location, depth: 0 };
+        }
+
+        /* 2. 沿原型链 */
+        let depth = 1, proto = _getProto(obj);
+        while (proto !== null && proto !== undefined) {
+            let protoD = null;
+            try { protoD = _ownDesc(proto, key); } catch (_) {}
+
+            if (protoD && typeof protoD.value === 'function' && !isHooked(protoD.value)) {
+                const origFn = protoD.value;
+                const ownerType = proto.constructor?.name || 'Object';
+                const location = 'proto:' + depth;
+                const wrapped = function (...args) {
+                    const invokeThis = opts.bindThis !== undefined ? opts.bindThis : this;
+                    const ret = _rApply(origFn, invokeThis, unwrapArgs(args));
+                    record('call', basePath, key, args, ret, { location, ownerType, depth });
+                    return ret;
+                };
+                markHooked(wrapped, origFn);
+                try {
+                    _defProp(proto, key, {
+                        value: wrapped,
+                        writable: protoD.writable,
+                        enumerable: protoD.enumerable,
+                        configurable: true,
+                    });
+                } catch (_) {}
+                return { location, depth, ownerType };
+            }
+
+            proto = _getProto(proto);
+            depth++;
+            if (depth > 12) break;
+        }
+
+        return null;
+    }
+
     const _patched = new WeakSet();
 
     function patchDynamicObject(obj, pathHint) {
@@ -595,244 +822,447 @@
     /* ══════════════════════════════════════════════════
        document.createElement / createElementNS 拦截
     ══════════════════════════════════════════════════ */
+    /* ══════════════════════════════════════════════════
+       document / DOM 方法拦截
+       ─────────────────────────────────────────────────
+       核心原则：
+         ❌ 不做：doc[m] = wrapper         → 会在实例上产生 own property，
+                                              被 getOwnPropertyDescriptor(doc,'createElement')
+                                              探针识别为被篡改
+         ✅ 改为：在原型链上 defineProperty → own property 特征完全保持不变，
+                  wrapper 挂在 HTMLDocument.prototype 或 Document.prototype 上，
+                  实例本身 getOwnPropertyDescriptor 返回 undefined（与原生一致）
+
+       同理，Element 实例上也不直接赋值，
+       统一在对应的 prototype 上 wrap。
+    ══════════════════════════════════════════════════ */
     (function patchDocument() {
         const doc = document;
 
-        ['createElement', 'createElementNS'].forEach(m => {
-            const orig = doc[m].bind(doc);
-            doc[m] = function (...args) {
-                const el = orig(...args);
-                record('call', 'window.document', m, args, el);
-                patchDynamicObject(el, 'document.' + m + '(' + args.join(',') + ')');
-                return el;
-            };
-        });
+        /* ── 工具：在原型链上找到方法/属性所在层，并 wrap 那一层的 prototype ──
+           返回 { proto, desc } 或 null
+        */
+        function findProtoWithKey(obj, key) {
+            let p = _getProto(obj);          // 从第一层 proto 开始（跳过实例本身）
+            while (p) {
+                const d = _ownDesc(p, key);
+                if (d) return { proto: p, desc: d };
+                p = _getProto(p);
+            }
+            return null;
+        }
 
-        const DOM_METHODS = [
-            'querySelector',           // (selectors) → Element|null
-            'querySelectorAll',        // (selectors) → NodeList
-            'getElementById',         // (id) → Element|null
-            'getElementsByClassName', // (names) → HTMLCollection
-            'getElementsByTagName',   // (qualifiedName) → HTMLCollection
-            'getElementsByName',      // (elementName) → NodeList
-            'createTextNode',         // (data) → Text
-            'createDocumentFragment', // () → DocumentFragment
-            'createEvent',            // (eventInterface) → Event
-            'createComment',          // (data) → Comment
-            'createRange',            // () → Range
-            'createTreeWalker',       // (root, whatToShow?, filter?) → TreeWalker
-            'createNodeIterator',     // (root, whatToShow?, filter?) → NodeIterator
-            'importNode',             // (node, deep?) → Node
-            'adoptNode',              // (externalNode) → Node
-            'addEventListener',       // (type, listener, options?) → void
-            'removeEventListener',    // (type, listener, options?) → void
-            'dispatchEvent',          // (event) → boolean
-            'appendChild',            // (node) → Node
-            'removeChild',            // (child) → Node
-            'insertBefore',           // (newNode, refNode) → Node
-            'replaceChild',           // (newChild, oldChild) → Node
-            'write',                  // (...text) → void
-            'writeln',                // (...text) → void
-            'hasFocus',               // () → boolean
-            'elementFromPoint',       // (x, y) → Element|null
-            'elementsFromPoint',      // (x, y) → Element[]
-            'getSelection',           // () → Selection|null
-            'execCommand',            // (commandId, showUI?, value?) → boolean (deprecated)
-            'caretRangeFromPoint',    // (x, y) → Range|null
-            'getAnimations',          // (options?) → Animation[]
-            'getElementsFromPoint',   // (x, y) → Element[] (alias)
-            'open',                   // (url?, name?, features?) → Window|null
-            'close',                  // () → void
-        ];
-        DOM_METHODS.forEach(m => {
-            const orig = doc[m];
-            if (typeof orig !== 'function') return;
+        function readHookSafeProp(obj, key) {
+            if (obj === null || obj === undefined) return undefined;
+            let cur = obj, depth = 0;
+            while (cur !== null && cur !== undefined && depth < 12) {
+                try {
+                    const desc = _ownDesc(cur, key);
+                    if (desc) {
+                        if ('value' in desc) return desc.value;
+                        if (typeof desc.get === 'function') {
+                            const getter = getHookOriginal(desc.get);
+                            return _rApply(getter, obj, []);
+                        }
+                        return undefined;
+                    }
+                } catch (_) {}
+                cur = _getProto(cur);
+                depth++;
+            }
+            return undefined;
+        }
+
+        function getReadableTargetLabel(target, fallback) {
+            if (target === null || target === undefined) return fallback;
             try {
-                doc[m] = function (...args) {
+                const rawTagName = readHookSafeProp(target, 'tagName');
+                if (typeof rawTagName === 'string' && rawTagName) {
+                    const rawId = readHookSafeProp(target, 'id');
+                    const idSuffix = typeof rawId === 'string' && rawId ? '#' + rawId : '';
+                    return rawTagName.toLowerCase() + idSuffix;
+                }
+            } catch (_) {}
+            try {
+                return target.constructor?.name || fallback;
+            } catch (_) {
+                return fallback;
+            }
+        }
+
+        /* ── 工具：在 prototype 层面 wrap 一个方法 ──
+           只 wrap 一次（通过 __envHooked__ 标记），返回 true 表示成功
+        */
+        function wrapProtoMethod(obj, methodName, basePath) {
+            const found = findProtoWithKey(obj, methodName);
+            if (!found) return false;
+            const { proto, desc } = found;
+            // 已经 hook 过
+            if (isHooked(desc.value)) return true;
+            const origFn = desc.value;
+            if (typeof origFn !== 'function') return false;
+            try {
+                const wrapped = function (...args) {
                     const rawArgs = unwrapArgs(args);
-                    const ret = _rApply(orig, doc, rawArgs);
-                    record('call', 'window.document', m, args, ret);
+                    const ret = _rApply(origFn, this, rawArgs);
+                    record('call', basePath, methodName, args, ret);
                     return ret;
                 };
-            } catch (e) { _log('[EnvHook] ✗ doc.' + m, e.message); }
-        });
+                // 保留 native toString 外观
+                markHooked(wrapped, origFn);
+                _defProp(proto, methodName, {
+                    value: wrapped,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                });
+                return true;
+            } catch (e) {
+                _log('[EnvHook] ✗ wrapProtoMethod', methodName, e.message);
+                return false;
+            }
+        }
 
-        /* document 属性 */
+        /* ── 工具：在 prototype 层面 wrap 一个 getter 属性 ──
+           同样只在 proto 上改，不碰实例
+        */
+        function wrapProtoGetter(obj, propName, basePath, extraCb) {
+            const found = findProtoWithKey(obj, propName);
+            if (!found) return false;
+            const { proto, desc } = found;
+            if (!desc.get || isHooked(desc.get)) return true;
+            const origGet = desc.get;
+            try {
+                const newGet = function () {
+                    const v = _rApply(origGet, this, []);
+                    if (!_recording) record('get', basePath, propName, v);
+                    if (extraCb) extraCb(v, this);
+                    return v;
+                };
+                markHooked(newGet, origGet);
+                _defProp(proto, propName, {
+                    get: newGet,
+                    set: desc.set,
+                    enumerable: desc.enumerable,
+                    configurable: true,
+                });
+                return true;
+            } catch (e) {
+                _log('[EnvHook] ✗ wrapProtoGetter', propName, e.message);
+                return false;
+            }
+        }
+
+        /* ════════════════════════════════
+           document 方法 — 在 HTMLDocument.prototype / Document.prototype 上 wrap
+        ════════════════════════════════ */
+        const DOC_METHODS = [
+            // 元素创建（指纹核心：getOwnPropertyDescriptor(document,'createElement') 必须返回 undefined）
+            'createElement',           // (tagName, options?) → HTMLElement
+            'createElementNS',         // (ns, qualifiedName, options?) → Element
+            'createTextNode',          // (data) → Text
+            'createDocumentFragment',  // () → DocumentFragment
+            'createEvent',             // (eventInterface) → Event
+            'createComment',           // (data) → Comment
+            'createRange',             // () → Range
+            'createTreeWalker',        // (root, whatToShow?, filter?) → TreeWalker
+            'createNodeIterator',      // (root, whatToShow?, filter?) → NodeIterator
+            'createCDATASection',      // (data) → CDATASection
+            'createProcessingInstruction', // (target, data) → ProcessingInstruction
+            'createAttribute',         // (localName) → Attr
+            'createAttributeNS',       // (ns, qualifiedName) → Attr
+            // 查询
+            'querySelector',           // (selectors) → Element|null
+            'querySelectorAll',        // (selectors) → NodeList
+            'getElementById',          // (id) → Element|null
+            'getElementsByClassName',  // (names) → HTMLCollection
+            'getElementsByTagName',    // (qualifiedName) → HTMLCollection
+            'getElementsByTagNameNS',  // (ns, localName) → HTMLCollection
+            'getElementsByName',       // (elementName) → NodeList
+            // 节点操作
+            'importNode',              // (node, deep?) → Node
+            'adoptNode',               // (externalNode) → Node
+            'appendChild',             // (node) → Node
+            'removeChild',             // (child) → Node
+            'insertBefore',            // (newNode, refNode) → Node
+            'replaceChild',            // (newChild, oldChild) → Node
+            // 事件
+            'addEventListener',        // (type, listener, options?) → void
+            'removeEventListener',     // (type, listener, options?) → void
+            'dispatchEvent',           // (event) → boolean
+            // 其他
+            'write',                   // (...text) → void  (实际已废弃但常被检测)
+            'writeln',                 // (...text) → void
+            'hasFocus',                // () → boolean
+            'elementFromPoint',        // (x, y) → Element|null
+            'elementsFromPoint',       // (x, y) → Element[]
+            'getSelection',            // () → Selection|null
+            'execCommand',             // (commandId, showUI?, value?) → boolean (deprecated)
+            'caretRangeFromPoint',     // (x, y) → Range|null
+            'getAnimations',           // () → Animation[]
+            'open',                    // (url?, name?, features?) → Document
+            'close',                   // () → void
+            'exitFullscreen',          // () → Promise<void>
+            'exitPointerLock',         // () → void
+            'prepend',                 // (...nodes) → void
+            'append',                  // (...nodes) → void
+            'replaceChildren',         // (...nodes) → void
+        ];
+        DOC_METHODS.forEach(m => wrapProtoMethod(doc, m, 'window.document'));
+
+        // createElement 需要额外在 wrap 完成后加入 patchDynamicObject 逻辑
+        // 由于 wrapProtoMethod 已 wrap，这里在其基础上再叠加 iframe 注入逻辑
+        // 通过单独 override prototype 上的 wrapped fn 来追加行为
+        (function overrideCreateElement() {
+            const found = findProtoWithKey(doc, 'createElement');
+            if (!found) return;
+            const { proto } = found;
+            const alreadyWrapped = proto.createElement;
+            _defProp(proto, 'createElement', {
+                value: function (tagName, options) {
+                    const el = _rApply(alreadyWrapped, this, [tagName, options]);
+                    patchDynamicObject(el, 'document.createElement(' + tagName + ')');
+                    // iframe 注入由 patchIframes 的 MutationObserver 负责，这里不重复
+                    return el;
+                },
+                writable: true, enumerable: false, configurable: true,
+            });
+        })();
+
+        /* ════════════════════════════════
+           document 属性 — 同样在 prototype 上 wrap getter
+        ════════════════════════════════ */
         const HIGH_FREQ_PROPS = new Set(['body', 'documentElement', 'head']);
         const _propThrottle = Object.create(null);
         const THROTTLE_MS = 100;
 
-        const ELEMENT_MEASURE_METHODS = [
-            'getBoundingClientRect',  // () → DOMRect
-            'getClientRects',         // () → DOMRectList
-            'addEventListener',
-            'removeEventListener',
-            'getAttribute',           // (name) → string|null
-            'setAttribute',           // (name, value) → void
-            'removeAttribute',        // (name) → void
-            'hasAttribute',           // (name) → boolean
-            'getAttributeNames',      // () → string[]
-            'querySelector',
-            'querySelectorAll',
-            'appendChild',
-            'removeChild',
-            'insertBefore',
-            'replaceWith',            // (...nodes) → void
-            'replaceChildren',        // (...nodes) → void
-            'dispatchEvent',
-            'contains',               // (other) → boolean
-            'closest',                // (selectors) → Element|null
-            'matches',                // (selectors) → boolean
-            'before',                 // (...nodes) → void
-            'after',                  // (...nodes) → void
-            'prepend',                // (...nodes) → void
-            'append',                 // (...nodes) → void
-            'remove',                 // () → void
-            'cloneNode',              // (deep?) → Node
-            'insertAdjacentHTML',     // (position, text) → void
-            'insertAdjacentElement',  // (position, element) → Element|null
-            'insertAdjacentText',     // (position, data) → void
-            'animate',                // (keyframes, options?) → Animation
-            'getAnimations',          // (options?) → Animation[]
-            'setPointerCapture',      // (pointerId) → void
-            'releasePointerCapture',  // (pointerId) → void
-            'requestFullscreen',      // (options?) → Promise<void>
-            'requestPointerLock',     // () → void
-            'scrollIntoView',         // (arg?) → void
-            'scrollTo',               // (x, y) | (options) → void
-            'scroll',                 // alias
-            'scrollBy',               // (x, y) | (options) → void
-            'focus',                  // (options?) → void
-            'blur',                   // () → void
-            'click',                  // () → void
-        ];
-        const ELEMENT_MEASURE_PROPS = [
-            'offsetWidth', 'offsetHeight', 'offsetTop', 'offsetLeft', 'offsetParent',
-            'scrollWidth', 'scrollHeight', 'scrollTop', 'scrollLeft',
-            'clientWidth', 'clientHeight', 'clientTop', 'clientLeft',
-            'innerText', 'innerHTML', 'outerHTML', 'textContent',
-            'style', 'className', 'classList', 'id', 'tagName', 'nodeName',
-            'children', 'childNodes', 'childElementCount',
-            'parentElement', 'parentNode', 'nextSibling', 'previousSibling',
-            'nextElementSibling', 'previousElementSibling',
-            'firstChild', 'lastChild', 'firstElementChild', 'lastElementChild',
-            'tabIndex', 'hidden', 'draggable', 'contentEditable',
-            'dataset', 'part', 'slot', 'role',
+        const DOC_PROPS = [
+            'cookie', 'domain', 'referrer', 'title', 'URL', 'documentURI',
+            'readyState', 'visibilityState', 'hidden',
+            'body', 'head', 'documentElement',
+            'location', 'baseURI', 'characterSet', 'charset', 'contentType',
+            'lastModified', 'compatMode', 'designMode', 'dir',
+            'defaultView', 'activeElement',
+            'fullscreenElement', 'fullscreenEnabled',
+            'pointerLockElement',
+            'pictureInPictureElement', 'pictureInPictureEnabled',
+            'fonts', 'images', 'links', 'forms', 'scripts',
+            'styleSheets', 'adoptedStyleSheets',
+            'children', 'childElementCount',
+            'currentScript', 'doctype', 'implementation',
+            'scrollingElement', 'timeline',
         ];
 
-        function wrapElement(el, elPath) {
-            if (!el || typeof el !== 'object') return el;
-            if (el.__isEnvProxy) return el;
-            if (rawToProxy.has(el)) return rawToProxy.get(el);
-            ELEMENT_MEASURE_METHODS.forEach(m => {
-                const orig = el[m];
-                if (typeof orig !== 'function') return;
+        DOC_PROPS.forEach(p => {
+            try {
+                const found = findProtoWithKey(doc, p);
+                if (!found || !found.desc.get || isHooked(found.desc.get)) return;
+                const { proto, desc } = found;
+                const origGet = desc.get;
+
+                if (HIGH_FREQ_PROPS.has(p)) {
+                    // 高频属性：节流 + 带调用栈
+                    const newGet = function () {
+                        const v = _rApply(origGet, this, []);
+                        if (!_recording) {
+                            const now = Date.now();
+                            const last = _propThrottle[p] || 0;
+                            if (now - last >= THROTTLE_MS) {
+                                _propThrottle[p] = now;
+                                _recording = true;
+                                try {
+                                    const stack = captureStack(3);
+                                    const entry = {
+                                        op: 'get', path: 'window.document → ' + p,
+                                        key: p, type: typeTag(v), val: shortVal(v), stack, ts: now,
+                                    };
+                                    _rApply(_push, records, [entry]);
+                                    _group('%c get %c window.document → ' + p,
+                                        'color:#fff;background:#185FA5;padding:1px 5px;border-radius:3px',
+                                        'color:#185FA5;font-weight:bold');
+                                    _log('%c value  ', 'color:#888', v);
+                                    if (stack.length) _log('%c stack  ', 'color:#aaa;font-size:11px', '\n' + stack.join('\n'));
+                                    _groupEnd();
+                                    if (window.__envHookCb) window.__envHookCb(entry);
+                                } finally { _recording = false; }
+                            }
+                        }
+                        return v;
+                    };
+                    markHooked(newGet, origGet);
+                    _defProp(proto, p, { get: newGet, set: desc.set, enumerable: desc.enumerable, configurable: true });
+                } else {
+                    const newGet = function () {
+                        const v = _rApply(origGet, this, []);
+                        record('get', 'window.document', p, v);
+                        return v;
+                    };
+                    markHooked(newGet, origGet);
+                    _defProp(proto, p, { get: newGet, set: desc.set, enumerable: desc.enumerable, configurable: true });
+                }
+            } catch (e) { _log('[EnvHook] ✗ doc prop', p, e.message); }
+        });
+
+        /* ════════════════════════════════
+           Element / Node / EventTarget prototype 上的方法也在 proto 层面 wrap
+           （同样避免在元素实例上产生 own property）
+        ════════════════════════════════ */
+        const PROTO_METHOD_MAP = [
+            // [构造器, 方法列表, basePath前缀]
+            [Element.prototype, [
+                'getBoundingClientRect', 'getClientRects',
+                'getAttribute', 'setAttribute', 'removeAttribute', 'hasAttribute', 'getAttributeNames',
+                'getAttributeNS', 'setAttributeNS', 'removeAttributeNS', 'hasAttributeNS',
+                'querySelector', 'querySelectorAll',
+                'closest', 'matches', 'contains',
+                'before', 'after', 'prepend', 'append', 'remove',
+                'replaceWith', 'replaceChildren',
+                'insertAdjacentHTML', 'insertAdjacentElement', 'insertAdjacentText',
+                'animate', 'getAnimations',
+                'setPointerCapture', 'releasePointerCapture', 'hasPointerCapture',
+                'requestFullscreen', 'requestPointerLock',
+                'scrollIntoView', 'scrollTo', 'scrollBy', 'scroll',
+                'focus', 'blur', 'click',
+                'toggleAttribute',
+                'getAttributeNode', 'setAttributeNode', 'removeAttributeNode',
+                'attachShadow', 'computedStyleMap',
+                'checkVisibility',
+            ], 'Element'],
+            [Node.prototype, [
+                'appendChild', 'removeChild', 'insertBefore', 'replaceChild',
+                'cloneNode', 'contains', 'hasChildNodes', 'normalize',
+                'compareDocumentPosition', 'isEqualNode', 'isSameNode',
+                'lookupPrefix', 'lookupNamespaceURI', 'isDefaultNamespace',
+                'dispatchEvent', 'addEventListener', 'removeEventListener',
+            ], 'Node'],
+            [HTMLElement.prototype, [
+                'attachInternals', 'showPopover', 'hidePopover', 'togglePopover',
+            ], 'HTMLElement'],
+        ];
+
+        PROTO_METHOD_MAP.forEach(([proto, methods, pathPrefix]) => {
+            methods.forEach(m => {
+                const desc = _ownDesc(proto, m);
+                if (!desc?.value || typeof desc.value !== 'function') return;
+                if (isHooked(desc.value)) return;
+                const origFn = desc.value;
                 try {
-                    el[m] = function (...args) {
-                        const ret = _rApply(orig, el, args);
-                        record('call', elPath, m, args, ret);
+                    const wrapped = function (...args) {
+                        const rawArgs = unwrapArgs(args);
+                        const ret = _rApply(origFn, this, rawArgs);
+                        const tag = getReadableTargetLabel(this, pathPrefix);
+                        record('call', tag, m, args, ret);
                         return ret;
                     };
+                    markHooked(wrapped, origFn);
+                    _defProp(proto, m, { value: wrapped, writable: true, enumerable: false, configurable: true });
                 } catch (_) {}
             });
-            ELEMENT_MEASURE_PROPS.forEach(p => {
-                try {
-                    let d, proto = el;
-                    while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                    if (!d?.get) return;
-                    const g = d.get;
-                    _defProp(el, p, {
-                        get() { const v = _rApply(g, el, []); record('get', elPath, p, v); return v; },
-                        set: d.set ? function (v) { _rApply(d.set, el, [v]); } : undefined,
-                        configurable: true,
-                    });
-                } catch (_) {}
-            });
-            return el;
-        }
-
-        // document 属性完整列表
-        [
-            'cookie',           // string (r/w)
-            'domain',           // string (r/w)
-            'referrer',         // string (readonly)
-            'title',            // string (r/w)
-            'URL',              // string (readonly)
-            'documentURI',      // string (readonly)
-            'readyState',       // DocumentReadyState (readonly)
-            'visibilityState',  // VisibilityState (readonly)
-            'hidden',           // boolean (readonly)
-            'body',             // HTMLElement (r/w)
-            'head',             // HTMLHeadElement (readonly)
-            'documentElement',  // HTMLHtmlElement (readonly)
-            'location',         // Location (readonly)
-            'baseURI',          // string (readonly)
-            'characterSet',     // string (readonly)
-            'charset',          // string (deprecated alias)
-            'contentType',      // string (readonly)
-            'lastModified',     // string (readonly)
-            'compatMode',       // string (readonly)
-            'designMode',       // string (r/w)
-            'dir',              // string (r/w)
-            'defaultView',      // WindowProxy|null (readonly)
-            'activeElement',    // Element|null (readonly)
-            'fullscreenElement',// Element|null (readonly)
-            'fullscreenEnabled',// boolean (readonly)
-            'pointerLockElement', // Element|null (readonly)
-            'pictureInPictureElement', // Element|null
-            'pictureInPictureEnabled', // boolean
-            'fonts',            // FontFaceSet (readonly)
-            'images',           // HTMLCollection (readonly)
-            'links',            // HTMLCollection (readonly)
-            'forms',            // HTMLCollection (readonly)
-            'scripts',          // HTMLCollection (readonly)
-            'styleSheets',      // StyleSheetList (readonly)
-            'adoptedStyleSheets', // CSSStyleSheet[] (r/w)
-            'children',         // HTMLCollection (readonly)
-            'childElementCount',// number (readonly)
-        ].forEach(p => {
-            try {
-                let d, proto = doc;
-                while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                if (!d?.get) return;
-                const g = d.get;
-                if (HIGH_FREQ_PROPS.has(p)) {
-                    _defProp(doc, p, {
-                        get() {
-                            const v = _rApply(g, doc, []);
-                            if (!_recording) {
-                                const now = Date.now();
-                                const last = _propThrottle[p] || 0;
-                                if (now - last >= THROTTLE_MS) {
-                                    _propThrottle[p] = now;
-                                    _recording = true;
-                                    try {
-                                        const stack = captureStack(3);
-                                        const entry = { op: 'get', path: 'window.document → ' + p, key: p, type: typeTag(v), val: shortVal(v), stack, ts: now };
-                                        _rApply(_push, records, [entry]);
-                                        _group('%c get %c window.document → ' + p,
-                                            'color:#fff;background:#185FA5;padding:1px 5px;border-radius:3px',
-                                            'color:#185FA5;font-weight:bold');
-                                        _log('%c value  ', 'color:#888', v);
-                                        if (stack.length) _log('%c stack  ', 'color:#aaa;font-size:11px', '\n' + stack.join('\n'));
-                                        _groupEnd();
-                                        if (window.__envHookCb) window.__envHookCb(entry);
-                                    } finally { _recording = false; }
-                                }
-                                wrapElement(v, 'document.' + p);
-                            }
-                            return v;
-                        },
-                        configurable: true,
-                    });
-                } else {
-                    _defProp(doc, p, {
-                        get() { const v = _rApply(g, doc, []); record('get', 'window.document', p, v); return v; },
-                        configurable: true,
-                    });
-                }
-            } catch (e) { _log('[EnvHook] ✗ doc.' + p, e.message); }
         });
+
+        /* ════════════════════════════════
+           Element prototype 属性 getter wrap
+           （offsetWidth 等布局属性在 HTMLElement.prototype 上）
+        ════════════════════════════════ */
+        const LAYOUT_PROPS = [
+            [HTMLElement.prototype, [
+                'offsetWidth', 'offsetHeight', 'offsetTop', 'offsetLeft', 'offsetParent',
+                'innerText',
+            ]],
+            [Element.prototype, [
+                'scrollWidth', 'scrollHeight', 'scrollTop', 'scrollLeft',
+                'clientWidth', 'clientHeight', 'clientTop', 'clientLeft',
+                'innerHTML', 'outerHTML',
+                'className', 'classList', 'id', 'tagName', 'nodeName',
+                'children', 'childElementCount',
+                'firstElementChild', 'lastElementChild',
+                'nextElementSibling', 'previousElementSibling',
+                'slot', 'part',
+                'shadowRoot', 'assignedSlot',
+            ]],
+            [Node.prototype, [
+                'textContent', 'nodeValue', 'nodeType',
+                'childNodes', 'firstChild', 'lastChild',
+                'parentElement', 'parentNode',
+                'nextSibling', 'previousSibling',
+                'isConnected', 'ownerDocument', 'baseURI',
+            ]],
+        ];
+
+        LAYOUT_PROPS.forEach(([proto, props]) => {
+            props.forEach(p => {
+                const desc = _ownDesc(proto, p);
+                if (!desc?.get || isHooked(desc.get)) return;
+                const origGet = desc.get;
+                try {
+                    const newGet = function () {
+                        const v = _rApply(origGet, this, []);
+                        const tag = getReadableTargetLabel(this, 'Element');
+                        record('get', tag, p, v);
+                        return v;
+                    };
+                    markHooked(newGet, origGet);
+                    _defProp(proto, p, {
+                        get: newGet,
+                        set: desc.set ? function (v) {
+                            const tag = getReadableTargetLabel(this, 'Element');
+                            record('set', tag, p, v);
+                            _rApply(desc.set, this, [v]);
+                        } : undefined,
+                        enumerable: desc.enumerable, configurable: true,
+                    });
+                } catch (_) {}
+            });
+        });
+
+        /* ════════════════════════════════
+           ★ 反检测探针检测：
+           监控 getOwnPropertyDescriptor(document/element, key) 的调用
+           若 key 属于"应在原型链上的方法"，标红警告 —— 说明对方在探测我们的 hook 痕迹
+        ════════════════════════════════ */
+        // 这些 key 本来就不在实例 own 上，若被 getOwnPropertyDescriptor 查到 => 反检测探针
+        const PROTO_ONLY_KEYS = new Set([
+            'createElement', 'createElementNS', 'querySelector', 'querySelectorAll',
+            'getElementById', 'getElementsByClassName', 'getElementsByTagName',
+            'addEventListener', 'removeEventListener', 'dispatchEvent',
+            'appendChild', 'removeChild', 'insertBefore', 'replaceChild',
+            'getAttribute', 'setAttribute', 'getBoundingClientRect',
+            'getClientRects', 'offsetWidth', 'offsetHeight',
+            'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable',
+        ]);
+
+        // 已在 patchObjectStatics 里 wrap 了 getOwnPropertyDescriptor，
+        // 这里利用 __envHookCb 对那些查询结果为"应在 proto 上"的情况追加高亮警告
+        const _origHookCb = window.__envHookCb;
+        window.__envHookCb = function (entry) {
+            // 先执行原有 FP 标记逻辑
+            if (_origHookCb) _rApply(_origHookCb, window, [entry]);
+
+            // 检测反 hook 探针：getOwnPropertyDescriptor 查了 proto-only 的 key
+            if (entry.key === 'getOwnPropertyDescriptor' && entry.queriedKey) {
+                const qk = entry.queriedKey;
+                if (PROTO_ONLY_KEYS.has(qk)) {
+                    entry.antiHookProbe = true;
+                    _warn(
+                        '%c🚨 ANTI-HOOK PROBE %c getOwnPropertyDescriptor(?, "' + qk + '")\n' +
+                        '  → 对方在检测 ' + qk + ' 是否被 hook 到实例上！\n' +
+                        '  → 本 hook 已在 prototype 层注入，own descriptor 为 undefined（安全）',
+                        'color:#fff;background:#8B0000;padding:3px 8px;border-radius:4px;font-weight:bold;font-size:13px',
+                        'color:#8B0000;font-weight:bold'
+                    );
+                }
+            }
+
+            // 检测 hasOwnProperty 调用（另一种探针方式）
+            if (entry.key === 'hasOwnProperty' && PROTO_ONLY_KEYS.has(entry.val)) {
+                entry.antiHookProbe = true;
+                _warn(
+                    '%c🚨 ANTI-HOOK PROBE %c hasOwnProperty("' + entry.val + '")',
+                    'color:#fff;background:#8B0000;padding:3px 8px;border-radius:4px;font-weight:bold',
+                    'color:#8B0000;font-weight:bold'
+                );
+            }
+        };
     })();
 
     /* ══════════════════════════════════════════════════
@@ -871,7 +1301,7 @@
             if (target === null || target === undefined) return { location: 'absent', depth: -1, ownerType: '' };
             try {
                 // 先检查 own
-                if (_rHas(target, key) || _ownDesc(target, key)) {
+                if (Object.prototype.hasOwnProperty.call(target, key) || _ownDesc(target, key)) {
                     return { location: 'own', depth: 0, ownerType: target.constructor?.name || 'Object' };
                 }
                 // 沿原型链向上
@@ -892,22 +1322,71 @@
             return { location: 'absent', depth: -1, ownerType: '' };
         }
 
+        /* ── 工具：收集原型链上每一层的 key 明细 ──
+           返回 [{ key, location: 'proto:N', ownerType }]
+        */
+        function collectProtoKeyDetails(target) {
+            const details = [];
+            const seen = new Set();
+            if (target === null || target === undefined) return details;
+            try {
+                let depth = 1, proto = _getProto(target);
+                while (proto !== null && proto !== undefined) {
+                    const ownerType = proto.constructor?.name || proto[Symbol.toStringTag] || 'Object';
+                    const keys = _rApply(_ownNames, Object, [proto]);
+                    for (const key of keys) {
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        details.push({
+                            key,
+                            location: 'proto:' + depth,
+                            ownerType,
+                        });
+                    }
+                    proto = _getProto(proto);
+                    depth++;
+                    if (depth > 10) break;  // 防止无限循环
+                }
+            } catch (_) {}
+            return details;
+        }
+
         /* ── 工具：收集完整原型链（用于 getPrototypeOf 展示）── */
         function collectProtoChain(obj) {
             const chain = [];
             let cur = obj, depth = 0;
             while (cur !== null && cur !== undefined && depth < 12) {
                 try {
+                    const ownKeys = (() => {
+                        try { return _rApply(_ownNames, Object, [cur]); } catch (_) { return []; }
+                    })();
+                    const ownSymbols = (() => {
+                        try { return _rApply(_ownSymbols, Object, [cur]); } catch (_) { return []; }
+                    })();
                     chain.push({
                         depth,
                         ctor: cur.constructor?.name || cur[Symbol.toStringTag] || '(anonymous)',
                         tag:  Object.prototype.toString.call(cur),
+                        ownKeyCount: ownKeys.length,
+                        ownKeysSample: ownKeys.slice(0, 8),
+                        symbolCount: ownSymbols.length,
                     });
                     cur = _getProto(cur);
                     depth++;
                 } catch (_) { break; }
             }
             return chain;
+        }
+
+        function formatProtoChainForLog(chain) {
+            return chain.map(node => {
+                const ownKeysSample = Array.isArray(node.ownKeysSample) ? node.ownKeysSample : [];
+                const keyPreview = ownKeysSample.length
+                    ? ownKeysSample.join(', ') + (node.ownKeyCount > ownKeysSample.length ? ', …' : '')
+                    : '(none)';
+                const symbolPreview = node.symbolCount ? `  symbols:${node.symbolCount}` : '';
+                return `[${node.depth}] ${node.ctor}  ${node.tag}  ownKeys(${node.ownKeyCount}): ${keyPreview}${symbolPreview}`;
+            });
         }
 
         /* ── 专用打印函数（不走通用 record，避免 shouldSkip 误判方法名）── */
@@ -966,25 +1445,18 @@
         /* ══ 各方法包装 ══ */
 
         // getOwnPropertyNames(target) → string[]
-        // 同时标注每个返回的 key 属于 own 还是某层 proto（getOwnPropertyNames 自身只返回 own，
-        // 但调用者真正想问的是"我能拿到哪些键"，所以额外报告 proto 上的键数作为参考）
+        // getOwnPropertyNames 自身只返回 own key；为便于补环境判断，
+        // 额外打印原型链上每个 key 所在层级与所属构造器
         const _origGOPN = O.getOwnPropertyNames;
         O.getOwnPropertyNames = function (target) {
             const ret = _rApply(_origGOPN, O, [target]);
             if (!isInteresting(target)) return ret;
-            // 统计 proto 链上还有多少键（调用者可能后续会访问它们）
-            let protoKeyCount = 0;
-            try {
-                let p = _getProto(target);
-                while (p && p !== Object.prototype) {
-                    protoKeyCount += _rApply(_origGOPN, O, [p]).length;
-                    p = _getProto(p);
-                }
-            } catch (_) {}
+            const protoKeys = collectProtoKeyDetails(target);
             printObjMeta('getOwnPropertyNames', target, {
-                'ownKeys':        ret,                          // 返回的 own key 列表
+                'ownKeys':        ret,                                                   // 返回的 own key 列表
                 'ownKeyCount':    ret.length,
-                'protoKeyCount':  protoKeyCount,                // 原型链上还有多少键（供参考）
+                'protoKeyCount':  protoKeys.length,                                      // 原型链上总共有多少 key
+                'protoKeys':      protoKeys.map(item => `${item.key}  <${item.location}>  [${item.ownerType}]`),
             }, ret);
             return ret;
         };
@@ -1038,7 +1510,7 @@
             const chain = collectProtoChain(target);
             printObjMeta('getPrototypeOf', target, {
                 'directProto':  ret?.constructor?.name || String(ret),
-                'protoChain':   chain.map(c => `[${c.depth}] ${c.ctor}  ${c.tag}`),
+                'protoChain':   formatProtoChainForLog(chain),
             }, ret);
             return ret;
         };
@@ -1179,7 +1651,7 @@
                 const chain = collectProtoChain(ret);
                 printObjMeta('create', proto, {
                     'newObjKeys':  props ? _objKeys(props) : [],
-                    'protoChain':  chain.map(c => `[${c.depth}] ${c.ctor}`),
+                    'protoChain':  formatProtoChainForLog(chain),
                 }, ret);
             }
             return ret;
@@ -1211,8 +1683,7 @@
     ══════════════════════════════════════════════════ */
     (function patchPrototypeAccess() {
         /* ── Reflect.getPrototypeOf ──
-           同样展示完整原型链（复用 patchObjectStatics 里已定义的 collectProtoChain 不行，
-           因为作用域不同；这里内联一份轻量版）
+           同样展示完整原型链
         */
         const origRGP = Reflect.getPrototypeOf;
         Reflect.getPrototypeOf = function (target) {
@@ -1225,16 +1696,8 @@
 
                 _recording = true;
                 try {
-                    // 构造原型链描述
-                    const chain = [];
-                    let cur = target, depth = 0;
-                    while (cur !== null && cur !== undefined && depth < 10) {
-                        try {
-                            chain.push('[' + depth + '] ' + (cur.constructor?.name || '?'));
-                            cur = origRGP(cur);
-                            depth++;
-                        } catch (_) { break; }
-                    }
+                    const chain = collectProtoChain(target);
+                    const chainForLog = formatProtoChainForLog(chain);
 
                     const entry = {
                         op: 'proto',
@@ -1242,7 +1705,7 @@
                         key: 'getPrototypeOf',
                         targetType: ctorName,
                         directProto: ret?.constructor?.name || String(ret),
-                        protoChain: chain,
+                        protoChain: chainForLog,
                         type: typeTag(ret),
                         val: shortVal(ret),
                         ts: Date.now(),
@@ -1257,7 +1720,7 @@
                     _log('%c target      ', 'color:#888;font-weight:bold', target);
                     _log('%c targetType  ', 'color:#aaa', ctorName);
                     _log('%c directProto ', 'color:#aaa', entry.directProto);
-                    _log('%c protoChain  ', 'color:#aaa', chain);
+                    _log('%c protoChain  ', 'color:#aaa', chainForLog);
                     _log('%c result      ', 'color:#888;font-weight:bold', ret);
                     _groupEnd();
 
@@ -1328,28 +1791,9 @@
     ══════════════════════════════════════════════════ */
     (function patchScreen() {
         const scr = screen;
-        [
-            'width',          // number - 屏幕总宽度
-            'height',         // number - 屏幕总高度
-            'availWidth',     // number - 可用宽度（扣除任务栏）
-            'availHeight',    // number - 可用高度
-            'availLeft',      // number - 可用区域左偏移
-            'availTop',       // number - 可用区域上偏移
-            'colorDepth',     // number - 颜色深度（位）
-            'pixelDepth',     // number - 像素深度（通常等于 colorDepth）
-            'orientation',    // ScreenOrientation 对象
-        ].forEach(p => {
-            try {
-                let d, proto = scr;
-                while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                if (!d?.get) return;
-                const g = d.get;
-                _defProp(scr, p, {
-                    get() { const v = _rApply(g, scr, []); record('get', 'window.screen', p, v); return v; },
-                    configurable: true,
-                });
-            } catch (_) {}
-        });
+        ['width', 'height', 'availWidth', 'availHeight',
+         'availLeft', 'availTop', 'colorDepth', 'pixelDepth', 'orientation',
+        ].forEach(p => wrapPropInPlace(scr, p, 'window.screen'));
     })();
 
     /* ══════════════════════════════════════════════════
@@ -1357,47 +1801,13 @@
     ══════════════════════════════════════════════════ */
     (function patchPerformance() {
         const perf = performance;
-        // 属性
-        [
-            'timeOrigin',           // DOMHighResTimeStamp - 页面初始化时间戳
-            'navigation',           // PerformanceNavigation (deprecated)
-            'timing',               // PerformanceTiming (deprecated)
-            'eventCounts',          // EventCounts map
-            'interactionCount',     // number
-        ].forEach(p => {
-            try {
-                let d, proto = perf;
-                while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                if (!d?.get) return;
-                const g = d.get;
-                _defProp(perf, p, {
-                    get() { const v = _rApply(g, perf, []); record('get', 'window.performance', p, v); return v; },
-                    configurable: true,
-                });
-            } catch (_) {}
-        });
-        // 方法
-        [
-            ['now',              '() → DOMHighResTimeStamp'],          // 高精度时间戳（指纹核心！）
-            ['getEntries',       '(options?) → PerformanceEntry[]'],   // 所有性能条目
-            ['getEntriesByType', '(type) → PerformanceEntry[]'],       // 按类型过滤
-            ['getEntriesByName', '(name, type?) → PerformanceEntry[]'],// 按名称过滤
-            ['mark',             '(name, options?) → PerformanceMark'],
-            ['measure',          '(name, start?, end?) → PerformanceMeasure'],
-            ['clearMarks',       '(name?) → void'],
-            ['clearMeasures',    '(name?) → void'],
-            ['clearResourceTimings', '() → void'],
-            ['setResourceTimingBufferSize', '(maxSize) → void'],
-            ['toJSON',           '() → object'],
-        ].forEach(([m]) => {
-            const orig = perf[m];
-            if (typeof orig !== 'function') return;
-            perf[m] = function (...args) {
-                const ret = _rApply(orig, perf, args);
-                record('call', 'window.performance', m, args, ret);
-                return ret;
-            };
-        });
+        ['timeOrigin', 'navigation', 'timing', 'eventCounts', 'interactionCount',
+        ].forEach(p => wrapPropInPlace(perf, p, 'window.performance'));
+
+        ['now', 'getEntries', 'getEntriesByType', 'getEntriesByName',
+         'mark', 'measure', 'clearMarks', 'clearMeasures',
+         'clearResourceTimings', 'setResourceTimingBufferSize', 'toJSON',
+        ].forEach(m => wrapMethodInPlace(perf, m, 'window.performance', { bindThis: perf }));
     })();
 
     /* ══════════════════════════════════════════════════
@@ -1668,67 +2078,28 @@
     (function patchNavigatorFull() {
         const nav = navigator;
 
-        // ── 属性（完整版，覆盖原版未捕获项）──
+        // ── 属性：全部用 wrapPropInPlace，自动按原始位置（own/proto:N）wrap ──
         [
-            'userAgent',            // string - UA 字符串
-            'userAgentData',        // NavigatorUAData (UA-CH 接口)
-            'appVersion',           // string (deprecated)
-            'appName',              // string (deprecated, always 'Netscape')
-            'appCodeName',          // string (deprecated, always 'Mozilla')
-            'platform',             // string - 平台标识（指纹核心）
-            'vendor',               // string - 供应商（'Google Inc.' etc.）
-            'vendorSub',            // string (deprecated, always '')
-            'product',              // string (deprecated, always 'Gecko')
-            'productSub',           // string ('20030107' etc.)
-            'language',             // string - 主语言
-            'languages',            // string[] - 语言列表（顺序即指纹）
-            'onLine',               // boolean
-            'cookieEnabled',        // boolean
-            'javaEnabled',          // function → boolean (deprecated)
-            'hardwareConcurrency',  // number - 逻辑 CPU 核数
-            'deviceMemory',         // number - RAM（GB，取整到最近 2 次方）
-            'maxTouchPoints',       // number
-            'doNotTrack',           // string|null
-            'globalPrivacyControl', // boolean|undefined
-            'plugins',              // PluginArray
-            'mimeTypes',            // MimeTypeArray
-            'pdfViewerEnabled',     // boolean
-            'webdriver',            // boolean - 自动化标记（反爬虫重点！）
-            'connection',           // NetworkInformation
-            'permissions',          // Permissions
-            'mediaDevices',         // MediaDevices
-            'mediaCapabilities',    // MediaCapabilities
-            'mediaSession',         // MediaSession
-            'credentials',          // CredentialsContainer
-            'geolocation',          // Geolocation
-            'clipboard',            // Clipboard
-            'share',                // function (deprecated)
-            'canShare',             // function
-            'storage',              // StorageManager
-            'locks',                // LockManager
-            'usb',                  // USB
-            'bluetooth',            // Bluetooth
-            'serial',               // Serial
-            'hid',                  // HID
-            'xr',                   // XR (WebXR)
-            'wakeLock',             // WakeLock
-            'userActivation',       // UserActivation
-            'keyboard',             // Keyboard
-            'gpu',                  // GPU (WebGPU)
-            'ink',                  // Ink
+            'userAgent', 'userAgentData', 'appVersion', 'appName', 'appCodeName',
+            'platform', 'vendor', 'vendorSub', 'product', 'productSub',
+            'language', 'languages', 'onLine', 'cookieEnabled',
+            'hardwareConcurrency', 'deviceMemory', 'maxTouchPoints',
+            'doNotTrack', 'globalPrivacyControl',
+            'plugins', 'mimeTypes', 'pdfViewerEnabled',
+            'webdriver',
+            'connection', 'permissions', 'mediaDevices', 'mediaCapabilities',
+            'mediaSession', 'credentials', 'geolocation', 'clipboard',
+            'share', 'canShare', 'storage', 'locks',
+            'usb', 'bluetooth', 'serial', 'hid', 'xr',
+            'wakeLock', 'userActivation', 'keyboard', 'gpu', 'ink',
         ].forEach(p => {
-            try {
-                let d, proto = nav;
-                while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                if (!d?.get && typeof nav[p] === 'undefined') return;
-                if (d?.get) {
-                    const g = d.get;
-                    _defProp(nav, p, {
-                        get() { const v = _rApply(g, nav, []); record('get', 'window.navigator', p, v); return v; },
-                        configurable: true,
-                    });
-                }
-            } catch (_) {}
+            const loc = wrapPropInPlace(nav, p, 'window.navigator');
+            if (!loc) return;
+            // 调试：首次注册时打一条位置信息（仅开发模式）
+            if (window.__envHookDebug) {
+                _log(`%c[EnvHook] navigator.${p} → ${loc.location} (${loc.ownerType || ''})`,
+                    'color:#0f6e56;font-size:10px');
+            }
         });
 
         // ── 方法 ──
@@ -1774,18 +2145,8 @@
                         return ret;
                     };
                 }
-                ['brands', 'mobile', 'platform'].forEach(p => {
-                    try {
-                        let d, proto = uaData;
-                        while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                        if (!d?.get) return;
-                        const g = d.get;
-                        _defProp(uaData, p, {
-                            get() { const v = _rApply(g, uaData, []); record('get', 'navigator.userAgentData', p, v); return v; },
-                            configurable: true,
-                        });
-                    } catch (_) {}
-                });
+                ['brands', 'mobile', 'platform'].forEach(p =>
+                    wrapPropInPlace(uaData, p, 'navigator.userAgentData'));
             }
         } catch (_) {}
 
@@ -1881,18 +2242,8 @@
         try {
             const conn = nav.connection;
             if (conn) {
-                ['effectiveType', 'downlink', 'downlinkMax', 'rtt', 'saveData', 'type'].forEach(p => {
-                    try {
-                        let d, proto = conn;
-                        while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                        if (!d?.get) return;
-                        const g = d.get;
-                        _defProp(conn, p, {
-                            get() { const v = _rApply(g, conn, []); record('get', 'navigator.connection', p, v); return v; },
-                            configurable: true,
-                        });
-                    } catch (_) {}
-                });
+                ['effectiveType', 'downlink', 'downlinkMax', 'rtt', 'saveData', 'type',
+                ].forEach(p => wrapPropInPlace(conn, p, 'navigator.connection'));
             }
         } catch (_) {}
 
@@ -2056,19 +2407,8 @@
                         return ret;
                     };
                 }
-                // wgslLanguageFeatures (属性)
-                ['wgslLanguageFeatures'].forEach(p => {
-                    try {
-                        let d, proto = gpu;
-                        while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                        if (!d?.get) return;
-                        const g = d.get;
-                        _defProp(gpu, p, {
-                            get() { const v = _rApply(g, gpu, []); record('get', 'navigator.gpu', p, v); return v; },
-                            configurable: true,
-                        });
-                    } catch (_) {}
-                });
+                ['wgslLanguageFeatures'].forEach(p =>
+                    wrapPropInPlace(gpu, p, 'navigator.gpu'));
             }
         } catch (_) {}
 
@@ -2096,23 +2436,12 @@
        ★ 新增：window 级别补充属性
     ══════════════════════════════════════════════════ */
     (function patchWindowExtra() {
-        // visualViewport（移动端 / 缩放场景指纹）
+        // visualViewport
         try {
             const vvp = window.visualViewport;
             if (vvp) {
-                ['width', 'height', 'offsetLeft', 'offsetTop',
-                 'pageLeft', 'pageTop', 'scale'].forEach(p => {
-                    try {
-                        let d, proto = vvp;
-                        while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                        if (!d?.get) return;
-                        const g = d.get;
-                        _defProp(vvp, p, {
-                            get() { const v = _rApply(g, vvp, []); record('get', 'window.visualViewport', p, v); return v; },
-                            configurable: true,
-                        });
-                    } catch (_) {}
-                });
+                ['width', 'height', 'offsetLeft', 'offsetTop', 'pageLeft', 'pageTop', 'scale',
+                ].forEach(p => wrapPropInPlace(vvp, p, 'window.visualViewport'));
             }
         } catch (_) {}
 
@@ -2334,54 +2663,19 @@
                     return ret;
                 };
             });
-            ['length', 'scrollRestoration', 'state'].forEach(p => {
-                try {
-                    let d, proto = hist;
-                    while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                    if (!d?.get) return;
-                    const g = d.get;
-                    _defProp(hist, p, {
-                        get() { const v = _rApply(g, hist, []); record('get', 'window.history', p, v); return v; },
-                        set: d.set ? function (v) { record('set', 'window.history', p, v); _rApply(d.set, hist, [v]); } : undefined,
-                        configurable: true,
-                    });
-                } catch (_) {}
-            });
+            ['length', 'scrollRestoration', 'state',
+            ].forEach(p => wrapPropInPlace(hist, p, 'window.history', { set: true }));
         }
 
         // Location
         const loc = window.location;
         if (loc) {
-            [
-                ['assign',   '(url: string) → void'],
-                ['replace',  '(url: string) → void'],
-                ['reload',   '(forceReload?: boolean) → void'],
-                ['toString', '() → string'],
-            ].forEach(([m]) => {
-                try {
-                    const orig = loc[m];
-                    if (typeof orig !== 'function') return;
-                    loc[m] = function (...args) {
-                        const ret = _rApply(orig, loc, args);
-                        record('call', 'window.location', m, args, ret);
-                        return ret;
-                    };
-                } catch (_) {}
-            });
+            ['assign', 'replace', 'reload', 'toString',
+            ].forEach(m => wrapMethodInPlace(loc, m, 'window.location'));
+
             ['href', 'protocol', 'host', 'hostname', 'port', 'pathname',
-             'search', 'hash', 'origin'].forEach(p => {
-                try {
-                    let d, proto = loc;
-                    while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                    if (!d?.get) return;
-                    const g = d.get;
-                    _defProp(loc, p, {
-                        get() { const v = _rApply(g, loc, []); record('get', 'window.location', p, v); return v; },
-                        set: d.set ? function (v) { record('set', 'window.location', p, v); _rApply(d.set, loc, [v]); } : undefined,
-                        configurable: true,
-                    });
-                } catch (_) {}
-            });
+             'search', 'hash', 'origin',
+            ].forEach(p => wrapPropInPlace(loc, p, 'window.location', { set: true }));
         }
     })();
 
@@ -2398,42 +2692,17 @@
             };
         }
 
-        // XMLHttpRequest
+        // XMLHttpRequest — XHRP 本身是 prototype，wrapMethodInPlace 会在 own 层找到并替换
         const XHRP = XMLHttpRequest.prototype;
-        [
-            ['open',               '(method, url, async?, user?, password?) → void'],
-            ['send',               '(body?: Document|XMLHttpRequestBodyInit|null) → void'],
-            ['abort',              '() → void'],
-            ['setRequestHeader',   '(name: string, value: string) → void'],
-            ['getResponseHeader',  '(name: string) → string|null'],
-            ['getAllResponseHeaders', '() → string'],
-            ['overrideMimeType',   '(mime: string) → void'],
-        ].forEach(([m]) => {
-            const orig = XHRP[m];
-            if (typeof orig !== 'function') return;
-            XHRP[m] = function (...args) {
-                const ret = _rApply(orig, this, args);
-                record('call', 'XMLHttpRequest', m, args, ret);
-                return ret;
-            };
-        });
+        ['open', 'send', 'abort', 'setRequestHeader',
+         'getResponseHeader', 'getAllResponseHeaders', 'overrideMimeType',
+        ].forEach(m => wrapMethodInPlace(XHRP, m, 'XMLHttpRequest'));
 
-        // XHR 属性
+        // XHR 属性（XHRP 上 own 的 getter，wrapPropInPlace 在 own 层处理）
         ['readyState', 'status', 'statusText', 'responseURL',
          'responseType', 'response', 'responseText', 'responseXML',
-         'timeout', 'withCredentials', 'upload'].forEach(p => {
-            try {
-                let d, proto = XHRP;
-                while (proto) { d = _ownDesc(proto, p); if (d) break; proto = _getProto(proto); }
-                if (!d?.get) return;
-                const g = d.get;
-                _defProp(XHRP, p, {
-                    get() { const v = _rApply(g, this, []); record('get', 'XMLHttpRequest', p, v); return v; },
-                    set: d.set ? function (v) { record('set', 'XMLHttpRequest', p, v); _rApply(d.set, this, [v]); } : undefined,
-                    configurable: true,
-                });
-            } catch (_) {}
-        });
+         'timeout', 'withCredentials', 'upload',
+        ].forEach(p => wrapPropInPlace(XHRP, p, 'XMLHttpRequest', { set: true }));
 
         // sendBeacon(url, data?) → boolean
         try {
@@ -2619,38 +2888,277 @@
     })();
 
     /* ── TOP_KEYS 挂载（window 级代理）────────────────── */
-    const TOP_KEYS = [
-        // ── window 自身引用（跨 frame 检测核心）──
-        'self',             // WindowProxy → 自身（与 window 等价，但 iframe 里不同）
-        'top',              // WindowProxy → 最顶层 frame
-        'parent',           // WindowProxy → 直接父 frame
-        'opener',           // WindowProxy|null → window.open() 的来源窗口
-        'frameElement',     // Element|null → 宿主 <iframe>/<frame>/<object> 元素
-        'frames',           // WindowProxy → frames 集合（与 window 等价但常被检测）
-        'length',           // number → frames 数量（iframe 计数指纹）
-        // ── 常规 ──
-        'navigator', 'screen', 'location', 'history',
-        'performance', 'crypto', 'devicePixelRatio',
+    /* ══════════════════════════════════════════════════
+       window 属性完整监控
+       ─────────────────────────────────────────────────
+       分三类处理：
+       A. WindowProxy 类（self/top/parent/frames/opener/frameElement/length）
+          → 无法 defineProperty，单独用 shadow getter 处理
+       B. window own data-property（name/closed/status/isSecureContext 等）
+          → 用 wrapPropInPlace 在 own 层 wrap
+       C. 构造器 / 对象 / 函数（navigator/XMLHttpRequest/AudioContext 等）
+          → 用 makeProxy 套代理，使访问时触发 record
+    ══════════════════════════════════════════════════ */
+
+    // ── B 类：window own 属性（用 wrapPropInPlace 按位置 wrap）──
+    // 这些属性在 window 实例 own 上或 Window.prototype 上，有 getter
+    const WINDOW_OWN_PROPS = [
+        // 基础状态
+        'name', 'closed', 'status', 'origin',
+        'isSecureContext', 'crossOriginIsolated', 'credentialless', 'originAgentCluster',
+        'offscreenBuffering', 'event',
+        // 布局 / 视口
         'innerWidth', 'innerHeight', 'outerWidth', 'outerHeight',
         'screenX', 'screenY', 'screenLeft', 'screenTop',
-        'pageXOffset', 'pageYOffset', 'scrollX', 'scrollY',
-        'localStorage', 'sessionStorage', 'indexedDB', 'caches',
-        'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource',
-        'Worker', 'SharedWorker', 'Notification',
-        'speechSynthesis', 'visualViewport',
-        'matchMedia', 'getComputedStyle',
+        'scrollX', 'pageXOffset', 'scrollY', 'pageYOffset',
+        'devicePixelRatio',
+        // bar 属性（指纹：Headless 里 visible=false）
+        'locationbar', 'menubar', 'personalbar', 'scrollbars', 'statusbar', 'toolbar',
+    ];
+    WINDOW_OWN_PROPS.forEach(p => {
+        try { wrapPropInPlace(window, p, 'window', { set: true }); } catch (_) {}
+    });
+
+    // ── A 类：WindowProxy 属性 ──
+    const WINDOW_PROXY_KEYS = new Set(['self', 'top', 'parent', 'frames', 'opener', 'frameElement', 'length']);
+
+    const TOP_KEYS = [
+        // ── A类（由 patchWindowProxyKeys 处理）──
+        'self', 'top', 'parent', 'opener', 'frameElement', 'frames', 'length',
+        // ── 已单独深度 patch 的对象 ──
+        'navigator', 'screen', 'location', 'history', 'performance', 'crypto',
+        'localStorage', 'sessionStorage', 'indexedDB', 'caches', 'cookieStore',
+        'scheduler', 'trustedTypes', 'speechSynthesis', 'visualViewport',
+        'navigation', 'external', 'clientInformation',
+        'document', 'customElements',
+        // ── 全局函数 ──
+        'fetch', 'getComputedStyle', 'matchMedia',
         'requestAnimationFrame', 'cancelAnimationFrame',
         'requestIdleCallback', 'cancelIdleCallback',
         'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
-        'queueMicrotask',
+        'queueMicrotask', 'structuredClone', 'reportError', 'createImageBitmap',
         'open', 'close', 'alert', 'confirm', 'prompt', 'print', 'postMessage',
-        'document', 'Intl', 'CSS',
+        'blur', 'focus', 'stop', 'find', 'atob', 'btoa',
+        'scroll', 'scrollTo', 'scrollBy', 'moveBy', 'moveTo', 'resizeBy', 'resizeTo',
+        'getSelection', 'webkitCancelAnimationFrame', 'webkitRequestAnimationFrame',
+        'webkitRequestFileSystem', 'webkitResolveLocalFileSystemURL',
+        'fetchLater', 'getScreenDetails', 'queryLocalFonts',
+        'showDirectoryPicker', 'showOpenFilePicker', 'showSaveFilePicker',
+        // ── 构造器 / 全局对象 ──
+        'Intl', 'CSS', 'WebAssembly', 'chrome', 'Temporal',
+        // Web API 构造器（指纹高价值）
+        'XMLHttpRequest', 'XMLHttpRequestUpload', 'XMLHttpRequestEventTarget', 'XMLDocument', 'XMLSerializer',
+        'WebSocket', 'Worker', 'SharedWorker', 'EventSource', 'BroadcastChannel',
+        'Notification', 'ServiceWorker', 'ServiceWorkerContainer', 'ServiceWorkerRegistration',
+        // WebGL
+        'WebGLRenderingContext', 'WebGL2RenderingContext',
+        'WebGLVertexArrayObject', 'WebGLUniformLocation', 'WebGLTransformFeedback',
+        'WebGLTexture', 'WebGLSync', 'WebGLShaderPrecisionFormat', 'WebGLShader',
+        'WebGLSampler', 'WebGLRenderbuffer', 'WebGLQuery', 'WebGLProgram',
+        'WebGLObject', 'WebGLFramebuffer', 'WebGLContextEvent', 'WebGLBuffer', 'WebGLActiveInfo',
+        // Audio
+        'AudioContext', 'OfflineAudioContext', 'BaseAudioContext',
+        'AudioBuffer', 'AudioBufferSourceNode', 'AudioNode', 'AudioParam', 'AudioParamMap',
+        'AudioWorkletNode', 'AudioListener', 'AudioDestinationNode', 'AudioScheduledSourceNode',
+        'AnalyserNode', 'BiquadFilterNode', 'ChannelMergerNode', 'ChannelSplitterNode',
+        'ConvolverNode', 'DelayNode', 'DynamicsCompressorNode', 'GainNode',
+        'IIRFilterNode', 'OscillatorNode', 'PannerNode', 'PeriodicWave',
+        'ScriptProcessorNode', 'StereoPannerNode', 'WaveShaperNode', 'MediaStreamAudioSourceNode',
+        // Canvas / 渲染
+        'CanvasRenderingContext2D', 'CanvasPattern', 'CanvasGradient',
+        'OffscreenCanvas', 'OffscreenCanvasRenderingContext2D', 'ImageBitmapRenderingContext',
+        'Path2D', 'ImageData', 'ImageBitmap',
+        // Media
+        'MediaStream', 'MediaStreamTrack', 'MediaRecorder', 'MediaSource', 'MediaSourceHandle',
+        'MediaQueryList', 'MediaQueryListEvent', 'MediaCapabilities', 'MediaDevices', 'MediaDeviceInfo',
+        'MediaKeys', 'MediaKeySession', 'MediaKeyStatusMap', 'MediaKeySystemAccess',
+        'MediaError', 'MediaEncryptedEvent', 'MediaList',
+        'MediaStreamAudioDestinationNode', 'MediaElementAudioSourceNode',
+        'VideoFrame', 'VideoDecoder', 'VideoEncoder', 'VideoPlaybackQuality', 'VideoColorSpace',
+        'AudioDecoder', 'AudioEncoder', 'AudioData',
+        'EncodedVideoChunk', 'EncodedAudioChunk',
+        'ImageCapture', 'ImageDecoder', 'ImageTrack', 'ImageTrackList',
+        // Network / Fetch
+        'Request', 'Response', 'Headers', 'ReadableStream', 'WritableStream', 'TransformStream',
+        'ReadableStreamDefaultReader', 'ReadableStreamBYOBReader',
+        'WebTransport', 'WebTransportError', 'WebTransportBidirectionalStream',
+        // Storage / DB
+        'IDBFactory', 'IDBDatabase', 'IDBTransaction', 'IDBObjectStore',
+        'IDBIndex', 'IDBKeyRange', 'IDBCursor', 'IDBCursorWithValue',
+        'IDBRequest', 'IDBOpenDBRequest', 'IDBVersionChangeEvent',
+        'StorageManager', 'CacheStorage', 'Cache',
+        'Storage', 'CookieStore', 'CookieStoreManager', 'CookieChangeEvent',
+        // Crypto
+        'Crypto', 'SubtleCrypto', 'CryptoKey',
+        // GPU / WebGPU
+        'GPU', 'GPUAdapter', 'GPUAdapterInfo', 'GPUDevice', 'GPUDeviceLostInfo',
+        'GPUBuffer', 'GPUBufferUsage', 'GPUTexture', 'GPUTextureView', 'GPUTextureUsage',
+        'GPUSampler', 'GPUBindGroup', 'GPUBindGroupLayout',
+        'GPUShaderModule', 'GPUShaderStage', 'GPUComputePipeline', 'GPURenderPipeline',
+        'GPUCommandEncoder', 'GPUCommandBuffer', 'GPURenderPassEncoder', 'GPUComputePassEncoder',
+        'GPUQueue', 'GPUQuerySet', 'GPURenderBundle', 'GPURenderBundleEncoder',
+        'GPUCanvasContext', 'GPUCompilationInfo', 'GPUCompilationMessage',
+        'GPUSupportedFeatures', 'GPUSupportedLimits', 'WGSLLanguageFeatures',
+        'GPUPipelineLayout', 'GPUExternalTexture', 'GPUError',
+        'GPUValidationError', 'GPUOutOfMemoryError', 'GPUInternalError', 'GPUPipelineError',
+        'GPUUncapturedErrorEvent', 'GPUMapMode', 'GPUColorWrite',
+        // Bluetooth / USB / Serial / HID
+        'Bluetooth', 'BluetoothDevice', 'BluetoothRemoteGATTServer',
+        'BluetoothRemoteGATTService', 'BluetoothRemoteGATTCharacteristic',
+        'BluetoothRemoteGATTDescriptor', 'BluetoothCharacteristicProperties',
+        'USB', 'USBDevice', 'USBConfiguration', 'USBInterface', 'USBAlternateInterface',
+        'USBEndpoint', 'USBConnectionEvent', 'USBInTransferResult', 'USBOutTransferResult',
+        'HID', 'HIDDevice', 'HIDConnectionEvent', 'HIDInputReportEvent',
+        'Serial', 'SerialPort',
+        // Sensors
+        'Sensor', 'Accelerometer', 'Gyroscope', 'LinearAccelerationSensor',
+        'GravitySensor', 'AbsoluteOrientationSensor', 'RelativeOrientationSensor',
+        'OrientationSensor', 'SensorErrorEvent',
+        // Geolocation
+        'Geolocation', 'GeolocationPosition', 'GeolocationCoordinates', 'GeolocationPositionError',
+        // Input
+        'Keyboard', 'KeyboardLayoutMap', 'PointerEvent', 'TouchEvent', 'Touch', 'TouchList',
+        'MouseEvent', 'KeyboardEvent', 'InputEvent', 'InputDeviceInfo', 'InputDeviceCapabilities',
+        'GamepadEvent', 'Gamepad', 'GamepadButton', 'GamepadHapticActuator',
+        'WheelEvent', 'DragEvent', 'ClipboardEvent',
+        // Clipboard
+        'Clipboard', 'ClipboardItem',
+        // Notifications / Push
+        'Notification', 'PushManager', 'PushSubscription', 'PushSubscriptionOptions',
+        // Permissions
+        'Permissions', 'PermissionStatus',
+        // WakeLock
+        'WakeLock', 'WakeLockSentinel',
+        // Payment
+        'PaymentRequest', 'PaymentResponse', 'PaymentAddress',
+        'PaymentManager', 'PaymentMethodChangeEvent', 'PaymentRequestUpdateEvent',
+        // Identity / Credentials
+        'Credential', 'CredentialsContainer', 'FederatedCredential', 'PasswordCredential',
+        'PublicKeyCredential', 'AuthenticatorResponse',
+        'AuthenticatorAssertionResponse', 'AuthenticatorAttestationResponse',
+        'OTPCredential', 'IdentityCredential',
+        // XR
+        'XRSystem', 'XRSession', 'XRFrame', 'XRView', 'XRViewport', 'XRViewerPose',
+        'XRPose', 'XRRigidTransform', 'XRReferenceSpace', 'XRBoundedReferenceSpace',
+        'XRInputSource', 'XRInputSourceArray', 'XRInputSourceEvent', 'XRInputSourcesChangeEvent',
+        'XRSessionEvent', 'XRReferenceSpaceEvent', 'XRRenderState',
+        'XRHitTestSource', 'XRHitTestResult', 'XRTransientInputHitTestSource',
+        'XRTransientInputHitTestResult', 'XRWebGLLayer', 'XRWebGLBinding',
+        // Speech
+        'SpeechRecognition', 'SpeechRecognitionEvent', 'SpeechRecognitionErrorEvent',
+        'SpeechSynthesis', 'SpeechSynthesisUtterance', 'SpeechSynthesisVoice',
+        'SpeechSynthesisEvent', 'SpeechSynthesisErrorEvent',
+        'SpeechGrammar', 'SpeechGrammarList',
+        'webkitSpeechRecognition', 'webkitSpeechGrammar', 'webkitSpeechGrammarList',
+        'webkitSpeechRecognitionError', 'webkitSpeechRecognitionEvent',
+        // Battery / Device Events
+        'BatteryManager', 'DeviceMotionEvent', 'DeviceOrientationEvent',
+        'DeviceMotionEventAcceleration', 'DeviceMotionEventRotationRate',
+        // File System
+        'FileSystemDirectoryHandle', 'FileSystemFileHandle', 'FileSystemHandle',
+        'FileSystemWritableFileStream', 'FileSystemObserver',
+        'File', 'FileList', 'FileReader', 'Blob', 'BlobEvent',
+        // Fonts
+        'FontFace', 'FontData', 'FontFaceSetLoadEvent',
+        // Observers
         'MutationObserver', 'ResizeObserver', 'IntersectionObserver', 'PerformanceObserver',
+        'ReportingObserver', 'PerformanceObserverEntryList',
+        'ResizeObserverEntry', 'ResizeObserverSize', 'IntersectionObserverEntry',
+        'MutationRecord',
+        // Performance
+        'Performance', 'PerformanceTiming', 'PerformanceNavigation',
+        'PerformanceMark', 'PerformanceMeasure', 'PerformanceEntry',
+        'PerformanceResourceTiming', 'PerformanceNavigationTiming',
+        'PerformancePaintTiming', 'PerformanceLongTaskTiming',
+        'PerformanceEventTiming', 'PerformanceElementTiming',
+        'PerformanceLongAnimationFrameTiming', 'PerformanceScriptTiming',
+        'PerformanceServerTiming', 'TaskAttributionTiming',
+        // DOM
+        'Node', 'Element', 'HTMLElement', 'HTMLDocument', 'Document', 'DocumentFragment',
+        'DocumentType', 'DocumentTimeline', 'ShadowRoot', 'Text', 'Comment', 'CDATASection',
+        'HTMLCanvasElement', 'HTMLIFrameElement', 'HTMLVideoElement', 'HTMLAudioElement',
+        'HTMLInputElement', 'HTMLFormElement', 'HTMLSelectElement', 'HTMLTextAreaElement',
+        'HTMLImageElement', 'HTMLScriptElement', 'HTMLLinkElement', 'HTMLStyleElement',
+        'HTMLButtonElement', 'HTMLDivElement', 'HTMLSpanElement', 'HTMLAnchorElement',
+        'HTMLMediaElement', 'HTMLBodyElement', 'HTMLHeadElement', 'HTMLHtmlElement',
+        'NodeList', 'NodeIterator', 'NodeFilter', 'TreeWalker', 'Range', 'StaticRange',
+        'HTMLCollection', 'HTMLOptionsCollection', 'HTMLAllCollection',
+        'RadioNodeList', 'NamedNodeMap', 'Attr',
+        'DOMRect', 'DOMRectReadOnly', 'DOMRectList', 'DOMMatrix', 'DOMMatrixReadOnly',
+        'DOMPoint', 'DOMPointReadOnly', 'DOMQuad', 'DOMParser',
+        'DOMStringList', 'DOMStringMap', 'DOMTokenList', 'DOMImplementation',
+        'DOMException', 'DOMError',
+        'MathMLElement', 'SVGElement', 'SVGSVGElement', 'SVGGElement',
+        // Events
+        'Event', 'CustomEvent', 'EventTarget', 'ErrorEvent', 'UIEvent',
+        'ProgressEvent', 'PopStateEvent', 'HashChangeEvent', 'StorageEvent',
+        'PageTransitionEvent', 'PromiseRejectionEvent', 'MessageEvent', 'MessagePort', 'MessageChannel',
+        'FocusEvent', 'CompositionEvent', 'FormDataEvent', 'SubmitEvent',
+        'TransitionEvent', 'AnimationEvent', 'BeforeUnloadEvent',
+        'TrackEvent', 'TimeRanges', 'MediaStreamEvent', 'MediaStreamTrackEvent',
+        'RTCTrackEvent', 'RTCPeerConnectionIceEvent', 'RTCDataChannelEvent',
+        'RTCDTMFToneChangeEvent', 'RTCErrorEvent', 'RTCPeerConnectionIceErrorEvent',
+        'SecurityPolicyViolationEvent', 'ContentVisibilityAutoStateChangeEvent',
+        'ToggleEvent', 'CloseEvent', 'PictureInPictureEvent', 'PictureInPictureWindow',
+        // RTC
+        'RTCPeerConnection', 'RTCSessionDescription', 'RTCIceCandidate',
+        'RTCDataChannel', 'RTCRtpSender', 'RTCRtpReceiver', 'RTCRtpTransceiver',
+        'RTCSctpTransport', 'RTCDtlsTransport', 'RTCIceTransport',
+        'RTCStatsReport', 'RTCCertificate', 'RTCError',
+        'RTCEncodedVideoFrame', 'RTCEncodedAudioFrame', 'RTCDTMFSender',
+        'webkitRTCPeerConnection', 'webkitMediaStream',
+        // Misc Web APIs
+        'URL', 'URLSearchParams', 'URLPattern',
+        'FormData', 'DataTransfer', 'DataTransferItem', 'DataTransferItemList',
+        'TextEncoder', 'TextDecoder', 'TextEncoderStream', 'TextDecoderStream',
+        'CompressionStream', 'DecompressionStream',
+        'ByteLengthQueuingStrategy', 'CountQueuingStrategy',
+        'AbortController', 'AbortSignal',
+        'History', 'Location', 'Navigator', 'NavigatorUAData', 'NetworkInformation',
+        'Navigation', 'NavigationHistoryEntry', 'NavigationTransition', 'NavigationDestination',
+        'NavigateEvent', 'NavigationActivation', 'NavigationCurrentEntryChangeEvent',
+        'Screen', 'ScreenOrientation', 'VisualViewport',
+        'Selection', 'Range', 'StaticRange',
+        'Animation', 'KeyframeEffect', 'AnimationTimeline', 'AnimationPlaybackEvent',
+        'AnimationEffect', 'DocumentTimeline', 'ScrollTimeline', 'ViewTimeline',
+        'ViewTransition', 'ViewTransitionTypeSet',
+        'CustomElementRegistry', 'ShadowRoot',
+        'TrustedTypePolicyFactory', 'TrustedTypePolicy',
+        'TrustedHTML', 'TrustedScript', 'TrustedScriptURL',
+        'IdleDetector', 'Lock', 'LockManager', 'Scheduling', 'Scheduler',
+        'EyeDropper', 'FontData',
+        'PressureObserver', 'PressureRecord',
+        'LaunchQueue', 'LaunchParams',
+        'Profiler',
+        'WebKitMutationObserver', 'WebKitCSSMatrix', 'webkitURL',
+        'XPathResult', 'XPathExpression', 'XPathEvaluator', 'XMLSerializer',
+        'Option', 'Image', 'Audio',
+        'PluginArray', 'Plugin', 'MimeTypeArray', 'MimeType',
+        'Geolocation', 'UserActivation',
+        'EventSource', 'EventCounts',
+        'IDBFactory',
+        'BarProp', 'External',
+        'CSSStyleDeclaration', 'CSSStyleSheet', 'CSS',
+        'StyleSheet', 'StyleSheetList', 'StylePropertyMap', 'StylePropertyMapReadOnly',
+        'MediaList',
+        'FontFaceSetLoadEvent',
+        'FeaturePolicy',
+        'VirtualKeyboard',
+        'DocumentPictureInPicture', 'DocumentPictureInPictureEvent',
+        'Fence', 'FencedFrameConfig',
+        'SharedStorage', 'SharedStorageWorklet',
+        'ProtectedAudience',
+        'Worklet', 'AudioWorklet',
+        'BackgroundFetchManager', 'BackgroundFetchRegistration', 'BackgroundFetchRecord',
+        'PeriodicSyncManager', 'SyncManager',
+        'PushManager',
+        'CaptureController', 'RestrictionTarget', 'CropTarget',
+        'Highlight', 'HighlightRegistry',
+        'TaskSignal', 'TaskController', 'TaskPriorityChangeEvent',
+        'Observable', 'Subscriber',
+        'launchQueue', 'viewport', 'fence', 'documentPictureInPicture', 'sharedStorage',
+        'chrome',
     ];
-
-    // self/top/parent/frames/opener/frameElement 是 WindowProxy，descriptor 为 non-configurable
-    // 无法用 defineProperty 覆盖，改为读取时拦截：用 Proxy 包一层 window 自身
-    const WINDOW_PROXY_KEYS = new Set(['self', 'top', 'parent', 'frames', 'opener', 'frameElement', 'length']);
 
     // 对 window 对象套一层 Proxy 来捕获 WindowProxy 属性访问
     // 注意：只对读取做 record，不影响返回值（直接返回真实值，不套 makeProxy，避免跨域报错）
